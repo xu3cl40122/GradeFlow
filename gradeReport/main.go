@@ -1,0 +1,320 @@
+package main
+
+import (
+	"encoding/csv"
+	"fmt"
+	"log"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// 固定欄位索引（成績之前的欄位，用位置讀取不依賴表頭）
+const (
+	FieldSubjectCode = 0  // 科目代號
+	FieldSubjectName = 1  // 科目名稱
+	FieldStudentID   = 2  // 學號
+	FieldYear        = 3  // 年級
+	FieldClass       = 4  // 班級
+	FieldSeatNumber  = 5  // 座號
+	FieldStudentName = 6  // 學生姓名
+	FieldGroup       = 7  // 組別
+	FieldChoice      = 8  // 選擇
+	FieldNonChoice   = 9  // 非選擇
+	FieldMakeupDeduct = 10 // 補考扣
+	FieldViolation   = 11 // 違規
+	FieldMakeupDeductScore = 12 // 補考扣分
+	FieldScore       = 13 // 成績
+	// 索引 14 之後是動態欄位（答案1-N），長度依考試而定
+)
+
+// 學生成績資料（完整欄位）
+type GradeRecord struct {
+	Row []string // 儲存完整的 CSV 列資料
+}
+
+// 取得特定欄位的輔助方法（使用固定索引）
+func (g *GradeRecord) SubjectCode() string { return g.getField(FieldSubjectCode) }
+func (g *GradeRecord) SubjectName() string { return g.getField(FieldSubjectName) }
+func (g *GradeRecord) StudentID() string   { return g.getField(FieldStudentID) }
+func (g *GradeRecord) Year() string        { return g.getField(FieldYear) }
+func (g *GradeRecord) Class() string       { return g.getField(FieldClass) }
+func (g *GradeRecord) SeatNumber() string  { return g.getField(FieldSeatNumber) }
+func (g *GradeRecord) StudentName() string { return g.getField(FieldStudentName) }
+func (g *GradeRecord) Group() string       { return g.getField(FieldGroup) }
+func (g *GradeRecord) Score() string       { return g.getField(FieldScore) }
+
+func (g *GradeRecord) getField(index int) string {
+	if index < len(g.Row) {
+		return strings.TrimSpace(g.Row[index])
+	}
+	return ""
+}
+
+// 教師資料
+type TeacherRecord struct {
+	SubjectCode string // 科目代號
+	SubjectName string // 科目名稱
+	Year        string // 年級
+	Class       string // 班級
+	Group       string // 組別
+	TeacherName string // 老師名稱
+	Email       string // email
+}
+
+// 用於分組的鍵值
+type ReportKey struct {
+	TeacherName string
+	Year        string
+	SubjectCode string
+	SubjectName string
+}
+
+// CSV 標題列
+var csvHeaders []string
+
+func main() {
+	fmt.Println("成績報表整理工具 (CSV 版本)")
+	fmt.Println("============================")
+
+	// 讀取成績資料
+	grades, err := readGradeCSV("data/grade.csv")
+	if err != nil {
+		log.Fatalf("讀取成績檔案失敗: %v", err)
+	}
+	fmt.Printf("成功讀取 %d 筆成績資料\n", len(grades))
+
+	// 讀取教師資料
+	teachers, err := readTeacherCSV("data/teacher.csv")
+	if err != nil {
+		log.Fatalf("讀取教師檔案失敗: %v", err)
+	}
+	fmt.Printf("成功讀取 %d 筆教師資料\n", len(teachers))
+
+	// 建立教師對應表 (科目代號+年級+班級+組別 -> 教師)
+	teacherMap := buildTeacherMap(teachers)
+
+	// 將學生成績與教師配對
+	reportData := matchStudentsToTeachers(grades, teacherMap)
+	fmt.Printf("成功配對 %d 個報表群組\n", len(reportData))
+
+	// 產生 CSV 報表
+	err = generateCSVReports(reportData)
+	if err != nil {
+		log.Fatalf("產生報表失敗: %v", err)
+	}
+
+	fmt.Println("報表產生完成！")
+}
+
+// 讀取 grade.csv 檔案
+func readGradeCSV(filename string) ([]GradeRecord, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	reader.FieldsPerRecord = -1 // 允許欄位數量不同（成績後的欄位長度會變）
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	var grades []GradeRecord
+	// 第一列是標題
+	if len(records) > 0 {
+		csvHeaders = records[0]
+		fmt.Printf("CSV 標題欄位數: %d\n", len(csvHeaders))
+		fmt.Printf("固定欄位（索引 0-13）: %v\n", csvHeaders[0:min(14, len(csvHeaders))])
+		if len(csvHeaders) > 14 {
+			fmt.Printf("動態欄位（索引 14+）: %d 個欄位\n", len(csvHeaders)-14)
+		}
+	}
+
+	// 跳過標題列，讀取資料
+	for i := 1; i < len(records); i++ {
+		row := records[i]
+		if len(row) == 0 {
+			continue
+		}
+
+		// 確保至少有固定欄位（到成績為止）
+		if len(row) < FieldScore+1 {
+			log.Printf("警告: 第 %d 列資料欄位不足 (需要至少 %d 個，實際 %d 個)，已跳過",
+				i+1, FieldScore+1, len(row))
+			continue
+		}
+
+		grade := GradeRecord{
+			Row: row,
+		}
+		grades = append(grades, grade)
+	}
+
+	return grades, nil
+}
+
+// 讀取 teacher.csv 檔案
+func readTeacherCSV(filename string) ([]TeacherRecord, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	reader := csv.NewReader(file)
+	records, err := reader.ReadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	var teachers []TeacherRecord
+	// 跳過標題列
+	for i, record := range records {
+		if i == 0 {
+			continue
+		}
+		if len(record) < 7 {
+			continue
+		}
+
+		teacher := TeacherRecord{
+			SubjectCode: strings.TrimSpace(record[0]),
+			SubjectName: strings.TrimSpace(record[1]),
+			Year:        strings.TrimSpace(record[2]),
+			Class:       strings.TrimSpace(record[3]),
+			Group:       strings.TrimSpace(record[4]),
+			TeacherName: strings.TrimSpace(record[5]),
+			Email:       strings.TrimSpace(record[6]),
+		}
+		teachers = append(teachers, teacher)
+	}
+
+	return teachers, nil
+}
+
+// 建立教師對應表
+func buildTeacherMap(teachers []TeacherRecord) map[string]TeacherRecord {
+	teacherMap := make(map[string]TeacherRecord)
+	for _, teacher := range teachers {
+		key := fmt.Sprintf("%s_%s_%s_%s",
+			teacher.SubjectCode,
+			teacher.Year,
+			teacher.Class,
+			teacher.Group,
+		)
+		teacherMap[key] = teacher
+	}
+	return teacherMap
+}
+
+// 將學生成績與教師配對
+func matchStudentsToTeachers(grades []GradeRecord, teacherMap map[string]TeacherRecord) map[ReportKey][]GradeRecord {
+	reportData := make(map[ReportKey][]GradeRecord)
+
+	for _, grade := range grades {
+		// 尋找對應的教師
+		key := fmt.Sprintf("%s_%s_%s_%s",
+			grade.SubjectCode(),
+			grade.Year(),
+			grade.Class(),
+			grade.Group(),
+		)
+
+		teacher, found := teacherMap[key]
+		if !found {
+			log.Printf("警告: 找不到對應教師 - 科目: %s, 年級: %s, 班級: %s, 組別: %s",
+				grade.SubjectCode(), grade.Year(), grade.Class(), grade.Group())
+			continue
+		}
+
+		// 建立報表鍵值 (教師+年級+科目)
+		reportKey := ReportKey{
+			TeacherName: teacher.TeacherName,
+			Year:        grade.Year(),
+			SubjectCode: grade.SubjectCode(),
+			SubjectName: grade.SubjectName(),
+		}
+
+		reportData[reportKey] = append(reportData[reportKey], grade)
+	}
+
+	return reportData
+}
+
+// 產生 CSV 報表
+func generateCSVReports(reportData map[ReportKey][]GradeRecord) error {
+	// 建立輸出資料夾
+	outputDir := "output"
+	err := os.MkdirAll(outputDir, 0755)
+	if err != nil {
+		return err
+	}
+
+	for key, grades := range reportData {
+		// 檔案名稱: 教師名稱_年級_科目.csv
+		filename := filepath.Join(outputDir,
+			fmt.Sprintf("%s_年級%s_%s.csv", key.TeacherName, key.Year, key.SubjectName))
+
+		err := createCSVReport(filename, key, grades)
+		if err != nil {
+			log.Printf("產生報表失敗 (%s): %v", filename, err)
+			continue
+		}
+		fmt.Printf("已產生: %s (%d 筆資料)\n", filename, len(grades))
+	}
+
+	return nil
+}
+
+// 建立單一 CSV 報表
+func createCSVReport(filename string, key ReportKey, grades []GradeRecord) error {
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 寫入標題列（使用原始 CSV 的標題）
+	if err := writer.Write(csvHeaders); err != nil {
+		return err
+	}
+
+	// 依班級和座號排序
+	sort.Slice(grades, func(i, j int) bool {
+		if grades[i].Class() != grades[j].Class() {
+			return grades[i].Class() < grades[j].Class()
+		}
+		// 嘗試將座號轉為數字比較
+		seatI, errI := strconv.Atoi(grades[i].SeatNumber())
+		seatJ, errJ := strconv.Atoi(grades[j].SeatNumber())
+		if errI == nil && errJ == nil {
+			return seatI < seatJ
+		}
+		return grades[i].SeatNumber() < grades[j].SeatNumber()
+	})
+
+	// 寫入資料（完整列）
+	for _, grade := range grades {
+		if err := writer.Write(grade.Row); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// 輔助函數：取最小值
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
