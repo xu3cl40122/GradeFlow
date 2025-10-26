@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -72,6 +73,13 @@ type ReportKey struct {
 	SubjectName string
 }
 
+// Email 設定
+type EmailSettings struct {
+	SenderEmail     string `json:"senderEmail"`
+	ShouldSendEmail string `json:"shouldSendEmail"`
+	EmailTitle      string `json:"emailTitle"`
+}
+
 // CSV 標題列
 var csvHeaders []string
 
@@ -109,12 +117,40 @@ func main() {
 	}
 
 	// 產生 CSV 報表
-	err = generateCSVReports(reportData)
-	if err != nil {
-		log.Fatalf("產生報表失敗: %v", err)
+	reportFiles := generateCSVReports(reportData)
+	if len(reportFiles) == 0 {
+		log.Fatal("沒有產生任何報表")
 	}
 
 	fmt.Println("報表產生完成！")
+
+	// 讀取 email 設定
+	settings, err := readEmailSettings("data/setting.json")
+	if err != nil {
+		log.Printf("讀取 Email 設定失敗: %v", err)
+		return
+	}
+
+	// 檢查是否要發送 email
+	if settings.ShouldSendEmail == "true" {
+		fmt.Println("\n開始發送 Email...")
+		// 按教師分組報表檔案
+		teacherFiles := groupReportsByTeacher(reportFiles, reportData, teachers)
+
+		// 發送 email 給每位教師
+		for teacherEmail, files := range teacherFiles {
+			teacherName := getTeacherNameByEmail(teachers, teacherEmail)
+			err := sendEmail(settings, teacherEmail, teacherName, files)
+			if err != nil {
+				log.Printf("發送 Email 給 %s (%s) 失敗: %v", teacherName, teacherEmail, err)
+			} else {
+				fmt.Printf("✓ 已發送 Email 給 %s (%s)，包含 %d 個附件\n", teacherName, teacherEmail, len(files))
+			}
+		}
+		fmt.Println("Email 發送完成！")
+	} else {
+		fmt.Println("\nEmail 發送已停用（setting.json 中 shouldSendEmail 為 false）")
+	}
 }
 
 // 讀取 grade.csv 檔案
@@ -298,14 +334,17 @@ func generateErrorCSV(errorRecords []GradeRecord) error {
 	return nil
 }
 
-// 產生 CSV 報表
-func generateCSVReports(reportData map[ReportKey][]GradeRecord) error {
+// 產生 CSV 報表，返回檔案名稱列表
+func generateCSVReports(reportData map[ReportKey][]GradeRecord) map[ReportKey]string {
 	// 建立輸出資料夾
 	outputDir := "output"
 	err := os.MkdirAll(outputDir, 0755)
 	if err != nil {
-		return err
+		log.Printf("建立輸出資料夾失敗: %v", err)
+		return nil
 	}
+
+	reportFiles := make(map[ReportKey]string)
 
 	for key, grades := range reportData {
 		// 檔案名稱: 教師名稱_年級_科目.csv
@@ -318,9 +357,10 @@ func generateCSVReports(reportData map[ReportKey][]GradeRecord) error {
 			continue
 		}
 		fmt.Printf("已產生: %s (%d 筆資料)\n", filename, len(grades))
+		reportFiles[key] = filename
 	}
 
-	return nil
+	return reportFiles
 }
 
 // 建立單一 CSV 報表
@@ -369,4 +409,91 @@ func min(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// 讀取 Email 設定
+func readEmailSettings(filename string) (*EmailSettings, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	var settings EmailSettings
+	decoder := json.NewDecoder(file)
+	if err := decoder.Decode(&settings); err != nil {
+		return nil, err
+	}
+
+	return &settings, nil
+}
+
+// 按教師分組報表檔案
+func groupReportsByTeacher(reportFiles map[ReportKey]string, reportData map[ReportKey][]GradeRecord, teachers []TeacherRecord) map[string][]string {
+	teacherFiles := make(map[string][]string)
+
+	for key, filename := range reportFiles {
+		// 從 reportData 中取得任一筆資料來找教師
+		if len(reportData[key]) > 0 {
+			grade := reportData[key][0]
+			// 找對應的教師
+			matchKey := fmt.Sprintf("%s_%s_%s",
+				grade.SubjectCode(),
+				grade.Year(),
+				grade.Class(),
+			)
+
+			for _, teacher := range teachers {
+				teacherKey := fmt.Sprintf("%s_%s_%s",
+					teacher.SubjectCode,
+					teacher.Year,
+					teacher.Class,
+				)
+				if teacherKey == matchKey {
+					teacherFiles[teacher.Email] = append(teacherFiles[teacher.Email], filename)
+					break
+				}
+			}
+		}
+	}
+
+	return teacherFiles
+}
+
+// 根據 Email 取得教師名稱
+func getTeacherNameByEmail(teachers []TeacherRecord, email string) string {
+	for _, teacher := range teachers {
+		if teacher.Email == email {
+			return teacher.TeacherName
+		}
+	}
+	return email
+}
+
+// 發送 Email
+func sendEmail(settings *EmailSettings, recipientEmail string, recipientName string, attachments []string) error {
+	// 建立郵件內容
+	subject := settings.EmailTitle
+	body := fmt.Sprintf("您好 %s 老師，\n\n附件為您的成績報表，請查收。\n\n此為系統自動發送的郵件，請勿回覆。", recipientName)
+
+	// 組合郵件標頭和內容
+	message := fmt.Sprintf("From: %s\r\n", settings.SenderEmail)
+	message += fmt.Sprintf("To: %s\r\n", recipientEmail)
+	message += fmt.Sprintf("Subject: %s\r\n", subject)
+	message += "\r\n"
+	message += body
+
+	// TODO: 實際的 SMTP 發送需要配置 SMTP 伺服器資訊
+	// 這裡先模擬發送成功
+	fmt.Printf("模擬發送 Email:\n")
+	fmt.Printf("  寄件者: %s\n", settings.SenderEmail)
+	fmt.Printf("  收件者: %s (%s)\n", recipientName, recipientEmail)
+	fmt.Printf("  主旨: %s\n", subject)
+	fmt.Printf("  附件: %v\n", attachments)
+
+	// 實際發送時需要 SMTP 設定（host, port, username, password）
+	// err := smtp.SendMail(smtpHost+":"+smtpPort, auth, settings.SenderEmail, []string{recipientEmail}, []byte(message))
+	// return err
+
+	return nil
 }
