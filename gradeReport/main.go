@@ -93,12 +93,20 @@ func main() {
 	}
 	fmt.Printf("成功讀取 %d 筆教師資料\n", len(teachers))
 
-	// 建立教師對應表 (科目代號+年級+班級+組別 -> 教師)
+	// 建立教師對應表 (科目代號+年級+班級 -> 教師，忽略組別)
 	teacherMap := buildTeacherMap(teachers)
 
 	// 將學生成績與教師配對
-	reportData := matchStudentsToTeachers(grades, teacherMap)
+	reportData, errorRecords := matchStudentsToTeachers(grades, teacherMap)
 	fmt.Printf("成功配對 %d 個報表群組\n", len(reportData))
+
+	if len(errorRecords) > 0 {
+		fmt.Printf("警告: %d 筆資料找不到對應教師\n", len(errorRecords))
+		// 產生錯誤記錄檔案
+		if err := generateErrorCSV(errorRecords); err != nil {
+			log.Printf("產生錯誤記錄檔案失敗: %v", err)
+		}
+	}
 
 	// 產生 CSV 報表
 	err = generateCSVReports(reportData)
@@ -142,11 +150,20 @@ func readGradeCSV(filename string) ([]GradeRecord, error) {
 			continue
 		}
 
-		// 確保至少有固定欄位（到成績為止）
-		if len(row) < FieldScore+1 {
-			log.Printf("警告: 第 %d 列資料欄位不足 (需要至少 %d 個，實際 %d 個)，已跳過",
-				i+1, FieldScore+1, len(row))
+		// 確保至少有基本識別欄位（到學生姓名為止，索引 0-6）
+		// 這樣即使沒有組別、成績等欄位也能被包含
+		if len(row) < FieldStudentName+1 {
+			log.Printf("警告: 第 %d 列資料欄位不足 (需要至少 %d 個基本欄位，實際 %d 個)，已跳過",
+				i+1, FieldStudentName+1, len(row))
 			continue
+		}
+
+		// 如果欄位不足，補齊到標題列的長度
+		if len(row) < len(csvHeaders) {
+			// 補空白欄位
+			paddedRow := make([]string, len(csvHeaders))
+			copy(paddedRow, row)
+			row = paddedRow
 		}
 
 		grade := GradeRecord{
@@ -201,11 +218,12 @@ func readTeacherCSV(filename string) ([]TeacherRecord, error) {
 func buildTeacherMap(teachers []TeacherRecord) map[string]TeacherRecord {
 	teacherMap := make(map[string]TeacherRecord)
 	for _, teacher := range teachers {
-		key := fmt.Sprintf("%s_%s_%s_%s",
+		// 組別 1, 2, 3 或空都視為沒有組別，配對時忽略組別
+		// 使用 科目代號_年級_班級 作為 key
+		key := fmt.Sprintf("%s_%s_%s",
 			teacher.SubjectCode,
 			teacher.Year,
 			teacher.Class,
-			teacher.Group,
 		)
 		teacherMap[key] = teacher
 	}
@@ -213,22 +231,22 @@ func buildTeacherMap(teachers []TeacherRecord) map[string]TeacherRecord {
 }
 
 // 將學生成績與教師配對
-func matchStudentsToTeachers(grades []GradeRecord, teacherMap map[string]TeacherRecord) map[ReportKey][]GradeRecord {
+func matchStudentsToTeachers(grades []GradeRecord, teacherMap map[string]TeacherRecord) (map[ReportKey][]GradeRecord, []GradeRecord) {
 	reportData := make(map[ReportKey][]GradeRecord)
+	var errorRecords []GradeRecord
 
 	for _, grade := range grades {
-		// 尋找對應的教師
-		key := fmt.Sprintf("%s_%s_%s_%s",
+		// 尋找對應的教師（忽略組別）
+		key := fmt.Sprintf("%s_%s_%s",
 			grade.SubjectCode(),
 			grade.Year(),
 			grade.Class(),
-			grade.Group(),
 		)
 
 		teacher, found := teacherMap[key]
 		if !found {
-			log.Printf("警告: 找不到對應教師 - 科目: %s, 年級: %s, 班級: %s, 組別: %s",
-				grade.SubjectCode(), grade.Year(), grade.Class(), grade.Group())
+			// 找不到對應教師，加入錯誤記錄
+			errorRecords = append(errorRecords, grade)
 			continue
 		}
 
@@ -243,7 +261,41 @@ func matchStudentsToTeachers(grades []GradeRecord, teacherMap map[string]Teacher
 		reportData[reportKey] = append(reportData[reportKey], grade)
 	}
 
-	return reportData
+	return reportData, errorRecords
+}
+
+// 產生錯誤記錄 CSV
+func generateErrorCSV(errorRecords []GradeRecord) error {
+	outputDir := "output"
+	err := os.MkdirAll(outputDir, 0755)
+	if err != nil {
+		return err
+	}
+
+	filename := filepath.Join(outputDir, "error.csv")
+	file, err := os.Create(filename)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	writer := csv.NewWriter(file)
+	defer writer.Flush()
+
+	// 寫入標題列
+	if err := writer.Write(csvHeaders); err != nil {
+		return err
+	}
+
+	// 寫入錯誤記錄
+	for _, record := range errorRecords {
+		if err := writer.Write(record.Row); err != nil {
+			return err
+		}
+	}
+
+	fmt.Printf("已產生錯誤記錄: %s (%d 筆資料)\n", filename, len(errorRecords))
+	return nil
 }
 
 // 產生 CSV 報表

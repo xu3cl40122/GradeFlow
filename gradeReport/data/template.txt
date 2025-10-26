@@ -1,0 +1,1 @@
+Hi, {teacher} 老師, {grade}的{subject}成績出來了
